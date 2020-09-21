@@ -37,6 +37,7 @@ static char *          queue_dirpath;
 
 typedef struct cur_state {
 
+  u64    new_execs;
   size_t map_size;
   size_t current_input_len;
   u8     payload[];
@@ -62,38 +63,18 @@ typedef struct fuzzer_stats {
 
 } fuzzer_stats_t;
 
-#if 0
-/* for testing */
-static void force_segfault(void) {
-
-  DBG("Crashing...");
-  /* If you don't segfault, what else will? */
-  printf("%d", ((int *)1337)[42]);
-
-}
-
-static void force_timeout(void) {
-
-  DBG("Timeout...");
-  static volatile int a = 1337;
-  while (a) {}
-
-}
-
-#endif
-
 int debug_LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   u32 i;
   fprintf(stderr, "Enter harness function %p %lu\n", data, size);
-  for (i = 0; i < 65536; i++)
+  for (i = 0; i < __afl_map_size; i++)
     if (__afl_area_ptr[i])
       fprintf(stderr, "Error: map unclean before harness: map[%04x]=0x%02x\n", i, __afl_area_ptr[i]);
 
   int ret = LLVMFuzzerTestOneInput(data, size);
 
   fprintf(stderr, "MAP:");
-  for (i = 0; i < 65536; i++)
+  for (i = 0; i < __afl_map_size; i++)
     if (__afl_area_ptr[i]) fprintf(stderr, " map[%04x]=0x%02x", i, __afl_area_ptr[i]);
   fprintf(stderr, "\n");
 
@@ -107,7 +88,17 @@ afl_exit_t harness_func(afl_executor_t *executor, u8 *input, size_t len) {
   (void)executor;
 
   LLVMFuzzerTestOneInput(input, len);
-  // debug_LLVMFuzzerTestOneInput(input, len);
+
+  return AFL_EXIT_OK;
+
+}
+
+/* The actual harness call: LLVMFuzzerTestOneInput */
+afl_exit_t debug_harness_func(afl_executor_t *executor, u8 *input, size_t len) {
+
+  (void)executor;
+
+  debug_LLVMFuzzerTestOneInput(input, len);
 
   return AFL_EXIT_OK;
 
@@ -151,7 +142,7 @@ static void handle_timeout(int sig, siginfo_t *info, void *ucontext) {
 
   if (!current_fuzz_input_msg) {
 
-    WARNF("SIGUSR/timeout happened, but not currently fuzzing!");
+    if (debug) WARNF("SIGUSR/timeout happened, but not currently fuzzing!");
     return;
 
   }
@@ -255,13 +246,26 @@ static void setup_signal_handlers(void) {
 
 }
 
+void client_send_stats(afl_engine_t *engine) {
+
+  llmp_client_t * llmp_client = engine->llmp_client;
+  llmp_message_t *msg = llmp_client_alloc_next(llmp_client, sizeof(u64));
+  msg->tag = LLMP_TAG_EXEC_STATS_V1;
+  u64 *x = (u64 *)msg->buf;
+  *x = engine->executions;
+  engine->executions = 0;
+  llmp_client_send(llmp_client, msg);
+  engine->last_update = afl_get_cur_time_s();
+
+}
+
 u8 execute(afl_engine_t *engine, afl_input_t *input) {
 
   size_t          i;
   afl_executor_t *executor = engine->executor;
 
   /* Check for engine to be configured properly. Only to check setup in newly forked threads so debug only */
-  AFL_TRY(afl_engine_check_configuration(engine), { FATAL("Engine configured incompletely"); });
+  // AFL_TRY(afl_engine_check_configuration(engine), { FATAL("Engine configured incompletely"); });
 
   executor->funcs.observers_reset(executor);
   executor->funcs.place_input_cb(executor, input);
@@ -269,8 +273,11 @@ u8 execute(afl_engine_t *engine, afl_input_t *input) {
   // TODO move to execute_init()
   if (unlikely(engine->start_time == 0)) {
 
+    engine->executions = 0;
+
     engine->start_time = afl_get_cur_time();
     engine->last_update = afl_get_cur_time_s();
+    client_send_stats(engine);
 
   }
 
@@ -305,17 +312,7 @@ u8 execute(afl_engine_t *engine, afl_input_t *input) {
   // afl_ret_t type to the callee
 
   /* Gather some stats */
-  if (engine->executions % 12345 && engine->last_update < afl_get_cur_time_s()) {
-
-    llmp_client_t * llmp_client = engine->llmp_client;
-    llmp_message_t *msg = llmp_client_alloc_next(llmp_client, sizeof(u64));
-    msg->tag = LLMP_TAG_EXEC_STATS_V1;
-    u64 *x = (u64 *)msg->buf;
-    *x = engine->executions;
-    llmp_client_send(llmp_client, msg);
-    engine->last_update = afl_get_cur_time_s();
-
-  }
+  if (unlikely(engine->executions % 123 && engine->last_update < afl_get_cur_time_s())) { client_send_stats(engine); }
 
   switch (run_result) {
 
@@ -341,7 +338,10 @@ afl_engine_t *initialize_fuzzer(char *in_dir, char *queue_dir, int argc, char *a
   /* Let's create an in-memory executor */
   in_memory_executor_t *in_memory_executor = calloc(1, sizeof(in_memory_executor_t));
   if (!in_memory_executor) { PFATAL("Unable to allocate mem."); }
-  in_memory_executor_init(in_memory_executor, harness_func);
+  if (debug)
+    in_memory_executor_init(in_memory_executor, debug_harness_func);
+  else
+    in_memory_executor_init(in_memory_executor, harness_func);
   in_memory_executor->argc = argc;
   in_memory_executor->argv = afl_argv_cpy_dup(argc, argv);
   in_memory_executor->base.funcs.init_cb = in_memory_fuzzer_initialize;
@@ -394,7 +394,7 @@ afl_engine_t *initialize_fuzzer(char *in_dir, char *queue_dir, int argc, char *a
   AFL_TRY(afl_mutator_scheduled_add_havoc_funcs(mutators_havoc),
           { FATAL("Error adding mutators: %s", afl_ret_stringify(err)); });
 
-  afl_fuzzing_stage_t *stage = afl_fuzzing_stage_new(engine);
+  afl_stage_t *stage = afl_stage_new(engine);
   if (!stage) { FATAL("Error creating fuzzing stage"); }
   AFL_TRY(stage->funcs.add_mutator_to_stage(stage, &mutators_havoc->base),
           { FATAL("Error adding mutator: %s", afl_ret_stringify(err)); });
@@ -433,7 +433,7 @@ void fuzzer_process_main(llmp_client_t *llmp_client, void *data) {
   /* set the global virgin_bits for error handlers, so we can restore them after a crash */
   virgin_bits = observer_covmap->shared_map.map;
 
-  afl_fuzzing_stage_t *    stage = (afl_fuzzing_stage_t *)engine->fuzz_one->stages[0];
+  afl_stage_t *            stage = engine->fuzz_one->stages[0];
   afl_mutator_scheduled_t *mutators_havoc = (afl_mutator_scheduled_t *)stage->mutators[0];
 
   afl_feedback_cov_t *coverage_feedback = (afl_feedback_cov_t *)(engine->feedbacks[0]);
@@ -456,7 +456,7 @@ void fuzzer_process_main(llmp_client_t *llmp_client, void *data) {
   afl_feedback_cov_delete(coverage_feedback);
   afl_observer_covmap_delete(observer_covmap);
   afl_mutator_scheduled_delete(mutators_havoc);
-  afl_fuzzing_stage_delete(stage);
+  afl_stage_delete(stage);
   afl_fuzz_one_delete(engine->fuzz_one);
 
   for (i = 0; i < engine->feedbacks_count; ++i) {
@@ -488,19 +488,27 @@ bool broker_handle_client_restart(llmp_broker_t *broker, llmp_broker_clientdata_
   }
 
   /* Remove this client, then spawn a new client with the current state.*/
+  DBG("Removing old/crashed client");
 
   /* TODO: We should probably waite for the old client pid to finish (or kill it?) before creating a new one */
   clientdata->client_state->current_broadcast_map = NULL;  // Don't kill our map :)
   llmp_client_delete(clientdata->client_state);
   afl_shmem_deinit(clientdata->cur_client_map);
 
+  DBG("Creating new client #phoenix");
   clientdata->client_state = llmp_client_new_unconnected();
+  if (!clientdata->client_state) { PFATAL("Error allocating replacement client after crash"); }
   /* restore old client id */
   clientdata->client_state->id = client_id;
-  if (!clientdata->client_state) { PFATAL("Error allocating replacement client after crash"); }
   /* link the new broker to the client at the position of the old client by connecting shmems. */
-  clientdata->client_state->current_broadcast_map = &broker->broadcast_maps[0];
-  clientdata->cur_client_map = &clientdata->client_state->out_maps[0];
+  /* TODO: Do this inside the forked thread instead? Right now, we're mapping it twice... */
+  afl_shmem_t *broadcast_map = calloc(1, sizeof(afl_shmem_t));
+  if (!broadcast_map) { PFATAL("Could not alloc mem for broadcast map"); }
+  afl_shmem_by_str(broadcast_map, broker->broadcast_maps[0].shm_str, broker->broadcast_maps[0].map_size);
+  clientdata->client_state->current_broadcast_map = broadcast_map;
+
+  afl_shmem_by_str(clientdata->cur_client_map, clientdata->client_state->out_maps[0].shm_str,
+                   clientdata->client_state->out_maps[0].map_size);
 
   /* restore the old virgin_bits for this fuzzer before reforking */
   afl_engine_t *engine = (afl_engine_t *)clientdata->data;
@@ -529,6 +537,10 @@ bool broker_handle_client_restart(llmp_broker_t *broker, llmp_broker_clientdata_
 /* A hook to keep stats in the broker thread */
 bool broker_message_hook(llmp_broker_t *broker, llmp_broker_clientdata_t *clientdata, llmp_message_t *msg, void *data) {
 
+  fuzzer_stats_t *       fuzzer_stats = ((fuzzer_stats_t *)data);
+  broker_client_stats_t *client_stats = &fuzzer_stats->clients[clientdata->client_state->id - 1];
+  client_stats->last_msg_time = afl_get_cur_time();
+
   DBG("Broker: msg hook called with msg tag %X", msg->tag);
   cur_state_t *state = NULL;
 
@@ -536,15 +548,14 @@ bool broker_message_hook(llmp_broker_t *broker, llmp_broker_clientdata_t *client
   switch (msg->tag) {
 
     case LLMP_TAG_NEW_QUEUE_ENTRY_V1:
-      ((fuzzer_stats_t *)data)->queue_entry_count++;
+      fuzzer_stats->queue_entry_count++;
       return true;  // Forward this to the clients
     case LLMP_TAG_EXEC_STATS_V1:
-      ((fuzzer_stats_t *)data)->clients[clientdata->client_state->id - 1].last_msg_time = afl_get_cur_time();
-      ((fuzzer_stats_t *)data)->clients[clientdata->client_state->id - 1].total_execs = *(LLMP_MSG_BUF_AS(msg, u64));
+      client_stats->total_execs += *(LLMP_MSG_BUF_AS(msg, u64));
       return false;  // don't forward this to the clients
     case LLMP_TAG_TIMEOUT_V1:
       DBG("We found a timeout...");
-      ((fuzzer_stats_t *)data)->timeouts++;
+      fuzzer_stats->timeouts++;
       /* write timeout output */
       state = LLMP_MSG_BUF_AS(msg, cur_state_t);
       afl_input_t timeout_input = {0};
@@ -558,12 +569,17 @@ bool broker_message_hook(llmp_broker_t *broker, llmp_broker_clientdata_t *client
               { WARNF("Could not write timeout file!"); });
 
       broker_handle_client_restart(broker, clientdata, state);
+
+      client_stats->total_execs += state->new_execs;
+      // Reset timeout
+      client_stats->last_msg_time = 0;
+
       return false;  // Don't foward this msg to clients.
 
     case LLMP_TAG_CRASH_V1:
 
       DBG("We found a crash!");
-      ((fuzzer_stats_t *)data)->crashes++;
+      fuzzer_stats->crashes++;
       /* write crash output */
       state = LLMP_MSG_BUF_AS(msg, cur_state_t);
       afl_input_t crashing_input = {0};
@@ -576,6 +592,10 @@ bool broker_message_hook(llmp_broker_t *broker, llmp_broker_clientdata_t *client
       AFL_TRY(afl_input_dump_to_crashfile(&crashing_input, queue_dirpath), { WARNF("Could not write crash file!"); });
 
       broker_handle_client_restart(broker, clientdata, state);
+
+      client_stats->total_execs += state->new_execs;
+      // Reset timeout
+      client_stats->last_msg_time = 0;
 
       return false;  // no need to foward this to clients.
     default:
@@ -634,10 +654,11 @@ int main(int argc, char **argv) {
 
   llmp_broker_t *llmp_broker = llmp_broker_new();
   if (!llmp_broker) { FATAL("Broker creation failed"); }
+
   /* This is not necessary but gives us the option to add additional processes to the fuzzer at runtime. */
   if (!llmp_broker_register_local_server(llmp_broker, broker_port)) { FATAL("Broker register failed"); }
 
-  OKF("Created broker for successfully.");
+  OKF("Created broker successfully.");
 
   /* The message hook will intercept all messages from all clients - and listen for stats. */
   fuzzer_stats_t fuzzer_stats = {0};
@@ -684,9 +705,11 @@ int main(int argc, char **argv) {
 
   while (1) {
 
+    /* Chill a bit */
+    usleep(200);
+
     /* Forward all messages that arrived in the meantime */
     llmp_broker_once(llmp_broker);
-    usleep(100);
 
     /* Paint ui every second */
     if ((time_cur = afl_get_cur_time_s()) > time_prev) {
